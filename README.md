@@ -10,12 +10,17 @@ It doesn't need access to the repos it tracks, or any setup on them.
 
 | Command | What it does |
 |---|---|
-| `/add link [channel]` | Track a repo (`https://github.com/owner/repo`), one branch (`…/tree/dev`), or every public repo of an account (`https://github.com/owner`). Posts go to the channel you run it in, or the one you pick. |
+| `/add link [channel] [ping] [ping_on]` | Track a repo (`https://github.com/owner/repo`), one branch (`…/tree/dev`), or every public repo of an account (`https://github.com/owner`). Posts go to the channel you run it in, or the one you pick. Optionally ping a role, on every update or only on crypto alerts. |
+| `/pingrole what [role] [ping_on]` | Change who gets pinged for something already tracked. Leave `role` empty to stop pinging. |
 | `/remove what` | Stop tracking something. Pick it from the list that pops up. |
-| `/list` | Show what this server tracks. |
+| `/list` | Show what this server tracks, and who gets pinged. |
 
-`/add` and `/remove` are for people with the **Manage Server** permission. To let a role
-use them, go to **Server Settings → Integrations → GitHub Tracker**.
+`/add`, `/pingrole` and `/remove` are for people with the **Manage Server** permission. To let
+a role use them, go to **Server Settings → Integrations → GitHub Tracker**.
+
+To ping a role, the role needs **Allow anyone to @mention this role** turned on (Server
+Settings → Roles), unless you give the bot the **Mention @everyone, @here and All Roles**
+permission. The bot tells you if it can't ping the role you picked.
 
 When a tracked account creates a new repo, the bot announces it and posts and scans its
 first commits too.

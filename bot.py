@@ -52,6 +52,60 @@ def embed_size(embed):
     return len(discord.Embed.from_dict(embed))
 
 
+PING_ON = [app_commands.Choice(name="Every update", value="all"),
+           app_commands.Choice(name="Only crypto alerts", value="crypto")]
+
+
+def pings(subs, crypto):
+    """(message text, allowed mentions) to ping the roles these subscriptions ask for, or (None, None).
+
+    `crypto` says whether the post includes a crypto alert. A ping role equal to the server's
+    id is @everyone.
+    """
+    roles = sorted({(s["guild"], s["ping"]) for s in subs
+                    if s.get("ping") and (s.get("ping_on", "all") == "all" or crypto)})
+    if not roles:
+        return None, None
+    everyone = any(role == guild for guild, role in roles)
+    text = " ".join("@everyone" if role == guild else f"<@&{role}>" for guild, role in roles)
+    return text, discord.AllowedMentions(everyone=everyone, users=False, replied_user=False,
+                                         roles=[discord.Object(role) for guild, role in roles if role != guild])
+
+
+def ping_label(sub):
+    if not sub.get("ping"):
+        return ""
+    who = "@everyone" if sub["ping"] == sub["guild"] else f"<@&{sub['ping']}>"
+    return f" - pings {who}" + (" on crypto alerts" if sub.get("ping_on") == "crypto" else "")
+
+
+def ping_not_allowed(member, role, channel):
+    """Why `member` may not make the bot ping `role` in `channel`, or None if they may.
+
+    Anyone can ping a role that allows @mentions. For @everyone or a locked role, the person
+    setting it up needs that permission themselves, so the bot can't be used to get around it.
+    """
+    if role.is_default() or not role.mentionable:
+        if not channel.permissions_for(member).mention_everyone:
+            name = "@everyone" if role.is_default() else f"@{role.name}"
+            return (f"You need the **Mention @everyone, @here and All Roles** permission in {channel.mention} "
+                    f"to make me ping **{name}**.")
+    return None
+
+
+def ping_problem(role, channel):
+    """Why the bot couldn't ping `role` in `channel`, or None if it can."""
+    if channel.permissions_for(channel.guild.me).mention_everyone:
+        return None  # allowed to ping any role
+    if role.is_default():
+        return ("To ping @everyone I need the **Mention @everyone, @here and All Roles** permission "
+                "in that channel.")
+    if not role.mentionable:
+        return (f"I can't ping **@{role.name}** yet. In **Server Settings → Roles → {role.name}**, "
+                "turn on **Allow anyone to @mention this role**.")
+    return None
+
+
 class Store:
     """What the bot remembers, saved to data/tracked.json.
 
@@ -107,22 +161,27 @@ class Store:
                 names |= {target_key(n, None) for n in self.account_repo_names(s["owner"])}
         return len(names)
 
-    def tracks(self, channel, full_name, branch):
-        """Whether `channel` (an id string) still tracks this repo+branch, directly or via its account."""
+    def covering_subs(self, channel, full_name, branch):
+        """The subscriptions through which `channel` (an id string) gets this repo+branch."""
         key = target_key(full_name, branch)
+        found = []
         for s in self.subs:
             if str(s["channel"]) != channel:
                 continue
             if s["repo"] and target_key(f"{s['owner']}/{s['repo']}", s["branch"]) == key:
-                return True
-            if not s["repo"] and branch is None and any(
+                found.append(s)
+            elif not s["repo"] and branch is None and any(
                     target_key(n, None) == key for n in self.account_repo_names(s["owner"])):
-                return True
-        return False
+                found.append(s)
+        return found
 
-    def tracks_account(self, channel, owner):
-        return any(not s["repo"] and s["owner"].lower() == owner.lower() and str(s["channel"]) == channel
-                   for s in self.subs)
+    def tracks(self, channel, full_name, branch):
+        """Whether `channel` (an id string) still tracks this repo+branch, directly or via its account."""
+        return bool(self.covering_subs(channel, full_name, branch))
+
+    def account_subs_in(self, channel, owner):
+        return [s for s in self.subs
+                if not s["repo"] and s["owner"].lower() == owner.lower() and str(s["channel"]) == channel]
 
     @staticmethod
     def account_entry(listing, etag):
@@ -154,6 +213,7 @@ class TrackerBot(discord.Client):
         self.lock = asyncio.Lock()  # one GitHub check or /add at a time
         self.restart_for_update = False
         self.synced_guilds = set()
+        self.alerted_now = {}
         add_commands(self)
 
     # ---------- Discord events ----------
@@ -171,6 +231,14 @@ class TrackerBot(discord.Client):
             g = guilds.get(s["guild"])
             return g is None or (not g.unavailable and g.get_channel(s["channel"]) is None)
         self.store.drop_subs(gone, "Server or channel no longer exists")
+        # ...and roles deleted meanwhile: stop pinging them.
+        stale = [s for s in self.store.subs if s.get("ping") and s["ping"] != s["guild"]
+                 and (g := guilds.get(s["guild"])) and not g.unavailable and g.get_role(s["ping"]) is None]
+        for s in stale:
+            s["ping"], s["ping_on"] = None, "all"
+        if stale:
+            self.store.save()
+            log.info("Stopped pinging %d deleted role(s)", len(stale))
         for guild in self.guilds:
             await self.sync_commands(guild)
         if not self.guilds:
@@ -183,6 +251,14 @@ class TrackerBot(discord.Client):
     async def on_guild_remove(self, guild):
         self.synced_guilds.discard(guild.id)
         self.store.drop_subs(lambda s: s["guild"] == guild.id, f"Removed from server {guild.name}")
+
+    async def on_guild_role_delete(self, role):
+        changed = [s for s in self.store.subs if s.get("ping") == role.id]
+        for s in changed:
+            s["ping"], s["ping_on"] = None, "all"
+        if changed:
+            self.store.save()
+            log.info("Role %s was deleted; stopped pinging it", role.name)
 
     async def on_guild_channel_delete(self, channel):
         self.store.drop_subs(lambda s: s["channel"] == channel.id, f"Channel #{channel.name} was deleted")
@@ -230,6 +306,7 @@ class TrackerBot(discord.Client):
     async def poll(self):
         async with self.lock:
             store = self.store
+            self.alerted_now = {}  # per repo and channel: crypto alerted during this check
             # 1. Refresh tracked accounts' repo lists, announcing repos created since last time.
             account_subs = {}
             for sub in store.subs:
@@ -298,9 +375,10 @@ class TrackerBot(discord.Client):
             # so its first content is posted and scanned (that's where a launch shows up).
             t = store.targets[target_key(r["name"], None)] = {"etag": None, "channels": {}}
             for channel in sorted(channels):
-                if store.tracks_account(channel, owner):  # not /removed in the meantime
+                subs = store.account_subs_in(channel, owner)
+                if subs:  # not /removed in the meantime
                     t["channels"][channel] = None
-                    await self.deliver(int(channel), [gh.new_repo_embed(r["name"])])
+                    await self.deliver(int(channel), [gh.new_repo_embed(r["name"])], *pings(subs, crypto=False))
 
     def rename_repo(self, old_name, new_name):
         """A tracked repo was renamed: move everything to the new name, so nothing is repeated or lost."""
@@ -355,10 +433,15 @@ class TrackerBot(discord.Client):
             alert, shown, leftover = await asyncio.to_thread(
                 detect.build_alert, w["name"], scans[last], set(seen), change["url"],
                 MESSAGE_LIMIT - embed_size(commits_post) - 50)
-            if not self.store.tracks(channel, w["name"], w["branch"]):
+            subs = self.store.covering_subs(channel, w["name"], w["branch"])
+            if not subs:
                 continue  # /removed while this check was running
-            if await self.deliver(int(channel), [commits_post] + ([alert] if alert else [])):
+            # Crypto-only pings go out when this post brings crypto: in its alert, in the follow-up,
+            # or crypto another branch of this repo alerted about in this channel earlier in this check.
+            crypto = bool(alert or leftover or set(scans[last]) & self.alerted_now.get(seen_key, set()))
+            if await self.deliver(int(channel), [commits_post] + ([alert] if alert else []), *pings(subs, crypto)):
                 t["channels"][channel] = head
+                self.alerted_now.setdefault(seen_key, set()).update(shown, (f["key"] for f in leftover))
                 if leftover:  # what didn't fit goes in one short follow-up
                     extra, keys = detect.leftover_embed(w["name"], leftover, change["url"])
                     if await self.deliver(int(channel), [extra]):
@@ -369,11 +452,15 @@ class TrackerBot(discord.Client):
                 delivered_all = False
         t["etag"] = etag if delivered_all else None  # a failed post is retried next time
 
-    async def deliver(self, channel_id, embeds):
-        """Posts embeds (dicts). False means try again later; True means done, or impossible."""
+    async def deliver(self, channel_id, embeds, content=None, mentions=None):
+        """Posts embeds (dicts), with optional text that pings the roles `mentions` allows.
+
+        False means try again later; True means done, or impossible.
+        """
         try:
             channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
-            await channel.send(embeds=[discord.Embed.from_dict(e) for e in embeds])
+            await channel.send(content=content, embeds=[discord.Embed.from_dict(e) for e in embeds],
+                               allowed_mentions=mentions or discord.AllowedMentions.none())
             return True
         except (discord.Forbidden, discord.NotFound) as e:
             if isinstance(e, discord.NotFound) and e.code == 10003:  # Unknown Channel
@@ -392,7 +479,7 @@ class TrackerBot(discord.Client):
 
     # ---------- Slash commands ----------
 
-    async def add_tracking(self, interaction, link, channel):
+    async def add_tracking(self, interaction, link, channel, role=None, ping_on="all"):
         target = channel or interaction.channel
         if not isinstance(target, discord.TextChannel):
             await interaction.response.send_message(
@@ -410,6 +497,10 @@ class TrackerBot(discord.Client):
             await interaction.response.send_message(
                 "That doesn't look like a GitHub link. Try something like `https://github.com/owner/repo`.",
                 ephemeral=True)
+            return
+        refused = role and ping_not_allowed(interaction.user, role, target)
+        if refused:
+            await interaction.response.send_message(refused, ephemeral=True)
             return
 
         await interaction.response.defer(thinking=True)
@@ -430,6 +521,9 @@ class TrackerBot(discord.Client):
                 await interaction.followup.send(result)
                 return
             sub, embed = result
+            if role:
+                sub["ping"], sub["ping_on"] = role.id, ping_on
+                embed["description"] = (embed["description"] + "\n\n" + self.ping_note(sub, role, target))[:4096]
             self.store.subs.append(sub)
             self.store.save()
             count = self.store.repo_count()
@@ -446,8 +540,16 @@ class TrackerBot(discord.Client):
     def already_tracked(self, interaction, channel, owner, repo, branch):
         for s in self.store.guild_subs(interaction.guild_id):
             if s["channel"] == channel.id and same_thing(s, owner, repo, branch):
-                return f"Already tracking **{sub_label(s)}** in {channel.mention}."
+                return (f"Already tracking **{sub_label(s)}** in {channel.mention}. "
+                        "To change who gets pinged, use `/pingrole`.")
         return None
+
+    @staticmethod
+    def ping_note(sub, role, channel):
+        when = "when there's a crypto alert" if sub.get("ping_on") == "crypto" else "on every update"
+        who = "@everyone" if role.is_default() else role.mention
+        problem = ping_problem(role, channel)
+        return f"Pings {who} {when}." + (f"\n**Heads up:** {problem}" if problem else "")
 
     async def start_repo(self, interaction, channel, owner, repo, branch):
         info = await asyncio.to_thread(gh.repo_info, owner, repo, self.github_token)
@@ -496,20 +598,24 @@ class TrackerBot(discord.Client):
             url=f"https://github.com/{login}")
         return sub, embed
 
-    async def remove_tracking(self, interaction, what):
+    def find_subs(self, interaction, what):
+        """This server's subscriptions matching a pick from the list (an id) or a pasted GitHub link."""
         subs = self.store.guild_subs(interaction.guild_id)
         matches = [s for s in subs if s["id"] == what.strip()]
         if not matches:
             try:
                 owner, repo, branch = gh.parse_link(what)
             except ValueError:
-                owner = None
-            if owner:
-                same_repo = [s for s in subs if s["owner"].lower() == owner.lower()
-                             and (s["repo"] or "").lower() == (repo or "").lower()]
-                matches = [s for s in same_repo if branch is None or s["branch"] == branch]
-                if not matches and branch:  # a .../tree/main link for a repo tracked as a whole
-                    matches = [s for s in same_repo if s["branch"] is None]
+                return []
+            same_repo = [s for s in subs if s["owner"].lower() == owner.lower()
+                         and (s["repo"] or "").lower() == (repo or "").lower()]
+            matches = [s for s in same_repo if branch is None or s["branch"] == branch]
+            if not matches and branch:  # a .../tree/main link for a repo tracked as a whole
+                matches = [s for s in same_repo if s["branch"] is None]
+        return matches
+
+    async def remove_tracking(self, interaction, what):
+        matches = self.find_subs(interaction, what)
         if not matches:
             await interaction.response.send_message(
                 "I'm not tracking that here. Use /list to see what's tracked.", ephemeral=True)
@@ -519,6 +625,43 @@ class TrackerBot(discord.Client):
         self.store.drop_subs(lambda s: s["id"] in ids, f"{interaction.user} used /remove")
         lines = "\n".join(f"• {sub_label(s)} in <#{s['channel']}>" for s in matches)
         await interaction.response.send_message(f"Stopped tracking:\n{lines}")
+
+    async def set_ping(self, interaction, what, role, ping_on):
+        matches = self.find_subs(interaction, what)
+        if matches and matches[0]["id"] != what.strip():
+            # A pasted link: only change what's meant, not every match in the server.
+            if any(s["branch"] is None for s in matches):
+                matches = [s for s in matches if s["branch"] is None]  # the repo itself, not its branches
+            if len({s["channel"] for s in matches}) > 1:
+                here = [s for s in matches if s["channel"] == interaction.channel_id]
+                if not here:
+                    await interaction.response.send_message(
+                        "That's tracked in more than one channel. Pick the one you mean from the list "
+                        "that pops up for `what`, or run this in that channel.", ephemeral=True)
+                    return
+                matches = here
+        if not matches:
+            await interaction.response.send_message(
+                "I'm not tracking that here. Use /list to see what's tracked.", ephemeral=True)
+            return
+        if role:
+            for s in matches:
+                channel = interaction.guild.get_channel(s["channel"])
+                refused = channel and ping_not_allowed(interaction.user, role, channel)
+                if refused:
+                    await interaction.response.send_message(refused, ephemeral=True)
+                    return
+        notes = []
+        for s in matches:  # no await in this loop, so a running check sees all or none of it
+            s["ping"], s["ping_on"] = (role.id, ping_on) if role else (None, "all")
+            channel = interaction.guild.get_channel(s["channel"])
+            if role and channel:
+                notes.append(f"**{sub_label(s)}** in {channel.mention}: {self.ping_note(s, role, channel)}")
+            else:
+                notes.append(f"**{sub_label(s)}** in <#{s['channel']}>: no pings any more.")
+        self.store.save()
+        log.info("%s set pings for %s", interaction.user, ", ".join(sub_label(s) for s in matches))
+        await interaction.response.send_message("\n".join(notes)[:2000])
 
     async def remove_choices(self, interaction, current):
         choices = []
@@ -546,7 +689,7 @@ class TrackerBot(discord.Client):
                 if not s["repo"]:
                     n = len(self.store.accounts.get(s["owner"].lower(), {}).get("repos", []))
                     extra = f" - {n} repo{'' if n == 1 else 's'}"
-                lines.append(f"• {sub_label(s)}{extra}")
+                lines.append(f"• {sub_label(s)}{extra}{ping_label(s)}")
             parts.append(f"<#{channel_id}>\n" + "\n".join(lines))
         embed = discord.Embed(title="Tracked in this server", description="\n\n".join(parts)[:4096], color=gh.GREEN)
         embed.set_footer(text=f"Checked every {self.poll_minutes} minutes")
@@ -556,11 +699,30 @@ class TrackerBot(discord.Client):
 def add_commands(bot):
     @app_commands.command(name="add", description="Track a GitHub repo, branch, or account")
     @app_commands.describe(link="A GitHub link: a repo, a branch (…/tree/name), or an account",
-                           channel="Where to post (default: this channel)")
+                           channel="Where to post (default: this channel)",
+                           ping="A role to ping when this posts (optional)",
+                           ping_on="When to ping that role (default: every update)")
+    @app_commands.choices(ping_on=PING_ON)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
-    async def add(interaction: discord.Interaction, link: str, channel: Optional[discord.TextChannel] = None):
-        await bot.add_tracking(interaction, link, channel)
+    async def add(interaction: discord.Interaction, link: str, channel: Optional[discord.TextChannel] = None,
+                  ping: Optional[discord.Role] = None, ping_on: Optional[app_commands.Choice[str]] = None):
+        await bot.add_tracking(interaction, link, channel, ping, ping_on.value if ping_on else "all")
+
+    @app_commands.command(name="pingrole", description="Choose a role to ping for something already tracked")
+    @app_commands.describe(what="Pick one from the list, or paste its GitHub link",
+                           role="The role to ping (leave empty to stop pinging)",
+                           ping_on="When to ping it (default: every update)")
+    @app_commands.choices(ping_on=PING_ON)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def pingrole(interaction: discord.Interaction, what: str, role: Optional[discord.Role] = None,
+                       ping_on: Optional[app_commands.Choice[str]] = None):
+        await bot.set_ping(interaction, what, role, ping_on.value if ping_on else "all")
+
+    @pingrole.autocomplete("what")
+    async def pingrole_autocomplete(interaction: discord.Interaction, current: str):
+        return await bot.remove_choices(interaction, current)
 
     @app_commands.command(name="remove", description="Stop tracking a repo or account")
     @app_commands.describe(what="Pick one from the list, or paste its GitHub link")
@@ -578,7 +740,7 @@ def add_commands(bot):
     async def list_(interaction: discord.Interaction):
         await bot.list_tracking(interaction)
 
-    for command in (add, remove, list_):
+    for command in (add, remove, pingrole, list_):
         bot.tree.add_command(command)
 
 
