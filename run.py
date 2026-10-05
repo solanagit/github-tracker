@@ -20,13 +20,15 @@ def recover():
     try:
         (here / "logs").mkdir(exist_ok=True)
         with open(here / "logs" / "bot.log", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  ERROR    Couldn't load updater.py; "
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  ERROR    updater.py failed; "
                     f"pulling the latest version from GitHub\n{traceback.format_exc()}\n")
     except OSError:
         pass
+    import shutil
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    for cmd in (["git", "-C", str(here), "-c", "safe.directory=*", "fetch", "--quiet", "origin"],
-                ["git", "-C", str(here), "-c", "safe.directory=*", "reset", "--quiet", "--hard", "@{upstream}"],
+    git = shutil.which("git") or r"C:\Program Files\Git\cmd\git.exe"
+    for cmd in ([git, "-C", str(here), "-c", "safe.directory=*", "fetch", "--quiet", "origin"],
+                [git, "-C", str(here), "-c", "safe.directory=*", "reset", "--quiet", "--hard", "@{upstream}"],
                 [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(here / "requirements.txt")]):
         try:
             subprocess.run(cmd, capture_output=True, timeout=300, creationflags=flags)
@@ -37,15 +39,15 @@ def recover():
 def main():
     try:
         import updater
-    except Exception:
-        recover()
-        return 1
-    if not updater.single_instance():
-        return 0
-    updater.setup_logging()
-    try:
+        if not updater.single_instance():
+            return 0
+        updater.setup_logging()
         updater.pull_update()
         updater.install_requirements()
+    except Exception:  # updater.py itself is broken: fix things without it
+        recover()
+        return 1
+    try:
         import bot  # imported only now, so the code just pulled is what runs
         return bot.main()
     except Exception as e:

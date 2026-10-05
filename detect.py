@@ -170,6 +170,23 @@ def scan_text(text, where, found, filename=None, prose=False):
     scan([(True, line) for line in text.splitlines()], where, found, filename, prose)
 
 
+def starts_in_code_block(lines, start):
+    """Whether the hunk starting at lines[start] begins inside a ``` code block.
+
+    A diff hunk can start in the middle of a block. Then its first fence is a closing one,
+    which shows as an odd number of fences that starts with a bare ``` (an opening fence
+    can name a language, a closing one can't).
+    """
+    fences = []
+    for item in lines[start + 1 if lines[start] is None else start:]:
+        if item is None:
+            break
+        stripped = item[1].strip()
+        if stripped.startswith("```"):
+            fences.append(bool(stripped[3:].strip()))
+    return len(fences) % 2 == 1 and not fences[0]
+
+
 def scan(lines, where, found, filename=None, prose=False):
     """Adds what the added lines mention to `found` ({key: finding}); `where` says where it was seen.
 
@@ -185,11 +202,11 @@ def scan(lines, where, found, filename=None, prose=False):
     assigned = set(ASSIGNED_NAME.findall("\n".join(item[1] for item in lines if item)))  # NAME=... -> $NAME is a variable
     in_fence = in_script = False
     recent_hints = []
-    for item in lines:
-        if item is None:  # a new hunk: what came before is a different part of the file
-            in_fence = in_script = False
-            recent_hints = []
-            continue
+    for i, item in enumerate(lines):
+        if item is None or i == 0:  # a new hunk: what came before is a different part of the file
+            in_fence, in_script, recent_hints = starts_in_code_block(lines, i), False, []
+            if item is None:
+                continue
         added, line = item
         stripped, low_line = line.strip(), line.lower()
         if stripped.startswith("```"):

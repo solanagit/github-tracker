@@ -263,8 +263,11 @@ class TrackerBot(discord.Client):
                 for name, branch in pairs:
                     w = wanted.setdefault(target_key(name, branch), {"name": name, "branch": branch, "channels": set()})
                     w["channels"].add(str(sub["channel"]))
+            # Keep the state of archived repos in tracked accounts: if one is unarchived, it carries on
+            # from where it was instead of skipping whatever is pushed right after.
+            account_repos = {target_key(n, None) for a in store.accounts.values() for n in a.get("ids", {}).values()}
             for key in list(store.targets):
-                if key not in wanted:
+                if key not in wanted and key not in account_repos:
                     del store.targets[key]
             channels_in_use = {str(s["channel"]) for s in store.subs}
             for key in list(store.seen):
@@ -283,24 +286,34 @@ class TrackerBot(discord.Client):
     async def account_changes(self, owner, known_ids, listing, channels):
         """Handles repos that appeared in a tracked account's listing since the last check."""
         store = self.store
+        # Renames first, so a new repo that takes over an old name doesn't inherit the old repo's state.
         for r in listing:
             old_name = known_ids.get(r["id"])
-            if old_name is None and not r["archived"]:
-                # Created, made public or moved into the account. Start from its very first commit,
-                # so its first content is posted and scanned (that's where a launch shows up).
-                t = store.targets.setdefault(target_key(r["name"], None), {"etag": None, "channels": {}})
-                for channel in sorted(channels):
-                    if self.store.tracks_account(channel, owner):  # not /removed in the meantime
-                        t["channels"].setdefault(channel, None)
-                        await self.deliver(int(channel), [gh.new_repo_embed(r["name"])])
-            elif old_name is not None and old_name != r["name"]:
-                # Renamed: carry over what was already posted and reported, so nothing is repeated.
-                old_key, new_key = target_key(old_name, None), target_key(r["name"], None)
-                if old_key in store.targets:
-                    store.targets[new_key] = store.targets.pop(old_key)
-                for seen_key in [k for k in store.seen if k.rsplit("#", 1)[0] == old_name.lower()]:
-                    store.seen[f"{r['name'].lower()}#{seen_key.rsplit('#', 1)[1]}"] = store.seen.pop(seen_key)
-                log.info("%s was renamed to %s", old_name, r["name"])
+            if old_name is not None and old_name != r["name"]:
+                self.rename_repo(old_name, r["name"])
+        for r in listing:
+            if r["id"] in known_ids or r["archived"]:
+                continue
+            # Created, made public or moved into the account. Start from its very first commit,
+            # so its first content is posted and scanned (that's where a launch shows up).
+            t = store.targets[target_key(r["name"], None)] = {"etag": None, "channels": {}}
+            for channel in sorted(channels):
+                if store.tracks_account(channel, owner):  # not /removed in the meantime
+                    t["channels"][channel] = None
+                    await self.deliver(int(channel), [gh.new_repo_embed(r["name"])])
+
+    def rename_repo(self, old_name, new_name):
+        """A tracked repo was renamed: move everything to the new name, so nothing is repeated or lost."""
+        store, old, new = self.store, old_name.lower(), new_name.lower()
+        new_owner, new_repo = new_name.split("/", 1)
+        for s in store.subs:  # subscriptions to the repo itself
+            if s["repo"] and f"{s['owner']}/{s['repo']}".lower() == old:
+                s["owner"], s["repo"] = new_owner, new_repo
+        for key in [k for k in store.targets if k.rsplit("@", 1)[0] == old]:  # every tracked branch
+            store.targets[new + "@" + key.rsplit("@", 1)[1]] = store.targets.pop(key)
+        for key in [k for k in store.seen if k.rsplit("#", 1)[0] == old]:
+            store.seen[new + "#" + key.rsplit("#", 1)[1]] = store.seen.pop(key)
+        log.info("%s was renamed to %s", old_name, new_name)
 
     async def check_target(self, key, w):
         t = self.store.targets.setdefault(key, {"etag": None, "channels": {}})
@@ -447,7 +460,10 @@ class TrackerBot(discord.Client):
         commits, _ = await asyncio.to_thread(gh.fetch_commits, full, branch, self.github_token)
         latest = commits[0] if commits else None
         t = self.store.targets.setdefault(target_key(full, branch), {"etag": None, "channels": {}})
-        t["channels"][str(channel.id)] = latest["sha"] if latest else None  # start from here
+        if not self.store.tracks(str(channel.id), full, branch):
+            # Start from here, unless this channel already follows the repo through its account:
+            # then it keeps its place, so commits not yet checked still get posted.
+            t["channels"][str(channel.id)] = latest["sha"] if latest else None
         sub = {"id": secrets.token_hex(4), "guild": interaction.guild_id, "channel": channel.id,
                "owner": owner, "repo": repo, "branch": branch, "added_by": interaction.user.id}
         embed = gh.make_embed(
