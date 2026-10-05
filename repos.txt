@@ -1,0 +1,7 @@
+# Repos to track, one GitHub link per line:
+#   https://github.com/owner/repo             a repo (its main branch)
+#   https://github.com/owner/repo/tree/dev    a specific branch
+#   https://github.com/owner                  every public repo of an account
+# Lines starting with # are ignored. Changes here reach the server within 10 minutes.
+
+https://github.com/Imdtools/imdtools
