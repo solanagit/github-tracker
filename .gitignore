@@ -1,5 +1,6 @@
 # Secrets and per-server state: these stay on the server, never on GitHub
 .env
-state.json
-*.log
+data/
+logs/
+.venv/
 __pycache__/
