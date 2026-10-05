@@ -54,7 +54,7 @@ Addresses every project mentions, like USDC or the Solana token program, are lef
 3. Open **PowerShell as Administrator** and run:
 
    ```powershell
-   git clone https://github.com/OWNER/github-tracker C:\github-tracker
+   git clone https://github.com/solanagit/github-tracker C:\github-tracker
    cd C:\github-tracker
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
